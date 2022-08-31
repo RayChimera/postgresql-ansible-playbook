@@ -1,0 +1,373 @@
+- name: Set up Postgres 13 with web-gui, monitoring and backups on Debian 11 w/ basic hardening
+  hosts: "{{ variable_host | default('regru') }}"
+  become: yes
+  become_method: sudo
+  vars:
+    postgresql_version: "13"
+    postgresql_bin_path: "/usr/lib/postgresql/{{ postgresql_version }}/bin"
+    postgresql_data_dir: "/var/lib/postgresql/{{ postgresql_version }}/main"
+    ansible_ssh_pipelining: true
+    ansible_become_pass: '{{ lookup("env", "ANSIBLE_BECOME_PASS") }}'
+    variable_host: '{{ lookup("env", "HOST") }}'
+    db_user: '{{ lookup("env", "DB_USER") }}'
+    db_password: '{{ lookup("env", "DB_PASSWORD") }}'
+    pgadmin_email: '{{ lookup("env", "PGADMIN_EMAIL") }}'
+    pgadmin_password: '{{ lookup("env", "PGADMIN_PASSWORD") }}'
+    tmp_folder: "{{ lookup('ansible.builtin.env', 'TMP_FOLDER', default='/tmp/ansible') }}"
+    restic_password: '{{ lookup("env", "RESTIC_PASSWORD") }}'
+  tasks:
+  - name: Preparation (1/3)
+    file:
+      path: "{{ tmp_folder }}"
+      state: directory
+      mode: 777
+
+  - name: Preparation (2/3)
+    command: hostname
+    register: hostname
+
+  - name: Preparation (3/3)
+    file:
+      path: "/srv/backups/"
+      state: directory
+      recurse: true
+
+  - name: Setting up PostgreSQL repo (1/2)
+    apt_key:
+      url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+      state: present
+
+  - name: Setting up PostgreSQL repo (2/2)
+    apt_repository:
+      repo: deb http://apt.postgresql.org/pub/repos/apt/ bullseye-pgdg main
+      state: present
+      update_cache: yes
+
+  - name: Installing PostgreSQL (1/11)
+    apt: upgrade=dist force_apt_get=yes
+
+  - name: Installing PostgreSQL (2/11)
+    apt:
+      name:
+        - postgresql-13
+        - postgresql-contrib-13
+        - libpq-dev
+        - python3-psycopg2
+      state: present
+      update_cache: yes
+
+  - name: Installing PostgreSQL (3/11)
+    stat:
+      path: "{{ postgresql_data_dir }}/pg_hba.conf"
+    register: postgres_data
+
+  - name: Installing PostgreSQL (4/11)
+    file:
+      path: "{{ postgresql_data_dir }}"
+      state: absent
+    when: not postgres_data.stat.exists
+
+  - name: Installing PostgreSQL (5/11)
+    shell: "{{ postgresql_bin_path }}/initdb -D {{ postgresql_data_dir }}"
+    become: true
+    become_user: postgres
+    when: not postgres_data.stat.exists
+
+  - name: Installing PostgreSQL (6/11)
+    service:
+      name: postgresql
+      state: started
+      enabled: true
+
+  - name: Installing PostgreSQL (7/11)
+    postgresql_user:
+      state: present
+      name: "{{ db_user | default('testuser') }}"
+      password: "{{ db_password | default('test') }}"
+    become: yes
+    become_user: postgres
+
+  - name: Installing PostgreSQL (8/11)
+    postgresql_db:
+      name: test
+      login_host: "localhost"
+      login_user: "{{ db_user | default('testuser') }}"
+      login_password: "{{ db_password | default('test') }}"
+      state: present
+
+  - name: Installing PostgreSQL (9/11)
+    community.postgresql.postgresql_privs:
+      login_host: "localhost"
+      login_user: "{{ db_user | default('testuser') }}"
+      login_password: "{{ db_password | default('test') }}"
+      db: postgres
+      privs: ALL
+      type: database
+      obj: "test"
+      role: "{{ db_user }}"
+
+  - name: Installing PostgreSQL (10/11)
+    copy:
+      src: files/dump.sql
+      dest: "{{ tmp_folder }}/dump.sql"
+      owner: postgres
+      group: postgres
+
+  - name: Installing PostgreSQL (11/11)
+    postgresql_db:
+      login_host: "localhost"
+      login_user: "{{ db_user | default('testuser') }}"
+      login_password: "{{ db_password | default('test') }}"
+      state: restore
+      name: "{{ db_name | default('test') }}"
+      target: "{{ tmp_folder }}/dump.sql"
+    become_user: postgres
+
+  - name: Installing pgadmin4 (1/6)
+    apt_key:
+      url: https://www.pgadmin.org/static/packages_pgadmin_org.pub
+      state: present
+
+  - name: Installing pgadmin4 (2/6)
+    apt_repository:
+      repo: deb https://ftp.postgresql.org/pub/pgadmin/pgadmin4/apt/bullseye pgadmin4 main
+      state: present
+      update_cache: yes
+
+  - name: Installing pgadmin4 (3/6)
+    apt: upgrade=dist force_apt_get=yes
+
+  - name: Installing pgadmin4 (4/6)
+    apt:
+      name:
+        - pgadmin4
+      state: present
+      update_cache: yes
+
+  - name: Installing pgadmin4 (5/6)
+    pip:
+      name: pip
+      extra_args: install pexpect
+      executable: pip3
+
+  - name: Installing pgadmin4 (6/6)
+    expect:
+      command: /usr/pgadmin4/bin/setup-web.sh
+      responses:
+          "Email address:": "{{ pgadmin_email | default('user@email.com') }}"
+          "Password:": "{{ pgadmin_password | default('testpass') }}"
+          "Retype password:": "{{ pgadmin_password | default('testpass') }}"
+          "Do you wish to continue (y/n)?": "y"
+          "Continue (y/n)?" : "y"
+    become: yes
+    become_method: sudo
+
+  - name: Installing Nagios (1/15)
+    apt:
+      name:
+      - vim
+      - wget
+      - curl
+      - build-essential
+      - unzip
+      - openssl
+      - libssl-dev
+      - apache2
+      - php
+      - libapache2-mod-php
+      - php-gd
+      - libgd-dev
+      state: latest
+      update_cache: true
+    become: true
+
+# Should work like this but turns out there's a bug in Nagios 4.4.7 that prevents it from starting, so I used the last working version instead ;)
+#  - name: Installing Nagios (2/15)
+#    ansible.builtin.shell: curl -s https://api.github.com/repos/NagiosEnterprises/nagioscore/releases/latest|grep tag_name | cut -d '"' -f 4
+#    register: nagios_version
+
+  - name: Installing Nagios (2/15)
+    command: echo "nagios-4.4.6"
+    register: nagios_version
+
+  - name: Installing Nagios (3/15)
+    ansible.builtin.shell: |
+      cd $TMP_FOLDER
+      wget https://github.com/NagiosEnterprises/nagioscore/releases/download/$NAGIOS_VER/$NAGIOS_VER.tar.gz
+      tar xvzf $NAGIOS_VER.tar.gz
+      cd $NAGIOS_VER
+      ./configure --with-httpd-conf=/etc/apache2/sites-enabled
+    environment:
+      NAGIOS_VER: "{{ nagios_version.stdout }}"
+      TMP_FOLDER: "{{ tmp_folder }}"
+
+  - name: Installing Nagios (4/15)
+    ansible.builtin.shell: |
+      cd $TMP_FOLDER/$NAGIOS_VER
+      make install-groups-users
+      usermod -a -G nagios www-data
+      make all
+      make install
+      make install-daemoninit
+      make install-commandmode
+      make install-config
+      make install-webconf
+      a2enmod rewrite cgi
+      htpasswd -c /usr/local/nagios/etc/htpasswd.users nagiosadmin
+      chown www-data:www-data /usr/local/nagios/etc/htpasswd.users
+      chmod 640 /usr/local/nagios/etc/htpasswd.users
+    become: true
+    environment:
+      NAGIOS_VER: "{{ nagios_version.stdout }}"
+      TMP_FOLDER: "{{ tmp_folder }}"
+
+  - name: Installing Nagios (5/15)
+    ansible.builtin.shell: curl -s https://api.github.com/repos/nagios-plugins/nagios-plugins/releases/latest|grep tag_name | cut -d '"' -f 4|sed 's/release-//'
+    register: nagios_plugins_version
+
+  - name: Installing Nagios (6/15)
+    ansible.builtin.shell: |
+      cd $TMP_FOLDER
+      wget https://github.com/nagios-plugins/nagios-plugins/releases/download/release-$NAGIOS_PLUGINS_VER/nagios-plugins-$NAGIOS_PLUGINS_VER.tar.gz
+      tar xvf nagios-plugins-$NAGIOS_PLUGINS_VER.tar.gz
+      cd nagios-plugins-$NAGIOS_PLUGINS_VER
+      ./configure --with-nagios-user=nagios --with-nagios-group=nagios
+    environment:
+      NAGIOS_PLUGINS_VER: "{{ nagios_plugins_version.stdout }}"
+      TMP_FOLDER: "{{ tmp_folder }}"
+
+  - name: Installing Nagios (7/15)
+    ansible.builtin.shell: |
+      cd $TMP_FOLDER/nagios-plugins-$NAGIOS_PLUGINS_VER
+      ./configure --with-nagios-user=nagios --with-nagios-group=nagios
+      make
+      make install
+    become: true
+    environment:
+      NAGIOS_PLUGINS_VER: "{{ nagios_plugins_version.stdout }}"
+      TMP_FOLDER: "{{ tmp_folder }}"
+
+  - name: Installing Nagios (8/15)
+    ansible.builtin.shell: |
+      cd $TMP_FOLDER
+      curl -LO https://github.com/bucardo/check_postgres/releases/download/2.24.0/check_postgres-2.24.0.tar.gz
+      tar xvf check_postgres-2.24.0.tar.gz
+    environment:
+      TMP_FOLDER: "{{ tmp_folder }}"
+
+  - name: Installing Nagios (9/15)
+    ansible.builtin.shell: |
+      cd $TMP_FOLDER
+      cp check_postgres-2.24.0/check_postgres.pl /usr/local/nagios/libexec/
+      chown nagios:nagios /usr/local/nagios/libexec/check_postgres.pl
+      cd /usr/local/nagios/libexec
+      perl check_postgres.pl --symlinks
+    become: true
+    environment:
+      TMP_FOLDER: "{{ tmp_folder }}"
+
+  - name: Installing Nagios (10/15)
+    copy:
+      src: files/pg_service.conf
+      dest: "/etc/postgresql-common/pg_service.conf"
+      owner: postgres
+      group: postgres
+
+  - name: Installing Nagios (11/15)
+    file:
+      path: "/usr/local/nagios/etc/objects/postgresql"
+      state: directory
+      recurse: yes
+
+  - name: Installing Nagios (12/15)
+    copy:
+      src: files/commands.cfg
+      dest: "/usr/local/nagios/etc/objects/postgresql/commands.cfg"
+      owner: postgres
+      group: postgres
+
+  - name: Installing Nagios (13/15)
+    copy:
+      src: files/services.cfg
+      dest: "/usr/local/nagios/etc/objects/postgresql/services.cfg"
+      owner: postgres
+      group: postgres
+
+  - name: Installing Nagios (14/15)
+    ansible.builtin.shell: >
+      grep -qxF 'cfg_dir=/usr/local/nagios/etc/objects/postgresql' /usr/local/nagios/etc/nagios.cfg 
+      || sed '/^#cfg_dir=\/usr\/local\/nagios\/etc\/servers/i cfg_dir=\/usr\/local\/nagios\/etc\/objects\/postgresql' 
+      /usr/local/nagios/etc/nagios.cfg -i.bkp
+    become: yes
+
+  - name: Installing Nagios (15/15)
+    ansible.builtin.shell: |
+      systemctl restart apache2
+      systemctl restart nagios.service
+      systemctl enable nagios.service
+    become: true
+
+  - name: Installing restic & making a backup (1/6)
+    apt:
+      name:
+      - restic
+      state: latest
+      update_cache: true
+    become: true
+
+  - name: Installing restic & making a backup (2/6)
+    stat: path=/srv/backups/config
+    register: p
+
+# Because of current infrastructure limitations a make a local repo, obviously it shouldn't be so in production
+  - name: Installing restic & making a backup (3/6)
+    expect:
+      command: restic init --repo /srv/backups
+      responses:
+          "enter password for new repository:": "{{ restic_password }}"
+          "enter password again:": "{{ restic_password }}"
+    when: not p.stat.exists
+    become: yes
+
+  - name: Installing restic & making a backup (4/6)
+    postgresql_db:
+      state: dump
+      name: "test"
+      target: "/tmp/postgresql_db.dump.gz"
+    become: true
+    become_user: postgres
+
+  - name: Installing restic & making a backup (5/6)
+    copy: src=/tmp/postgresql_db.dump.gz dest="{{ tmp_folder }}/postgresql_db.dump.gz" remote_src=yes
+    become: true
+
+# Ofc that should be done periodically and automatically (I personally used cron in the past)
+  - name: Installing restic & making a backup (6/6)
+    expect:
+      command: restic -r /srv/backups backup /tmp/ansible/postgresql_db.dump.gz
+      responses:
+          "enter password for repository:": "{{ restic_password }}"
+    environment:
+      TMP_FOLDER: "{{ tmp_folder }}"
+    become: yes
+
+  - name: Cleaning up
+    command: rm -rf $TMP_FOLDER
+    become: true
+    environment:
+      TMP_FOLDER: "{{ tmp_folder }}"
+
+  - name: Printing final report (1/2)
+    command: "{{ postgresql_bin_path }}/postgres -V"
+    register: postgresVersion
+
+  - name: Printing final report (2/2)
+    debug:
+      msg:
+      - "Final report: "
+      - "Postgres version: {{ postgresVersion.stdout }}"
+      - "pgadmin web page: http://{{ hostname.stdout }}/pgadmin4"
+      - "Nagios version: {{ nagios_version.stdout }}"
+      - "Nagios plugins version: {{ nagios_plugins_version.stdout }}"
+      - "Nagios web page: http://{{ hostname.stdout }}/nagios"
+      - "restic backup repo: /srv/backups"
